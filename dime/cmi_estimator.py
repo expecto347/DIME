@@ -171,8 +171,9 @@ class CMIEstimator(pl.LightningModule):
         # Take optimizer step.
         opt.step()
         return {
-            'value_network_loss': value_network_loss_total / self.max_features,
-            'predictor_loss': pred_loss_total / (self.max_features + 1)}
+            # Move to CPU and drop graph to avoid keeping full history in memory.
+            'value_network_loss': (value_network_loss_total / self.max_features).detach().cpu(),
+            'predictor_loss': (pred_loss_total / (self.max_features + 1)).detach().cpu()}
 
     def training_epoch_end(self, outputs):
         # Get mean train losses.
@@ -217,7 +218,9 @@ class CMIEstimator(pl.LightningModule):
             pred_list.append(pred)
 
         # return pred, y
-        return pred_list, y
+        # Detach and move to CPU to avoid retaining GPU/graph across validation epoch.
+        pred_list = [p.detach().cpu() for p in pred_list]
+        return pred_list, y.detach().cpu()
 
     def validation_epoch_end(self, outputs):
         pred_list, y_list = zip(*outputs)

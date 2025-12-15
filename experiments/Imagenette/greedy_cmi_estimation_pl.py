@@ -1,25 +1,30 @@
 # PyTorch lightning version
 
-import torch
 import argparse
-import numpy as np
-import torch.nn as nn
-from torchmetrics import Accuracy
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
-from torchmetrics import Accuracy
+import datetime
 import os
-from fastai.vision.all import untar_data, URLs
+import signal
+import sys
+import time
+import shutil
+
+import numpy as np
+import timm
+import torch
+import torch.nn as nn
+from fastai.vision.all import URLs, untar_data
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from dime.utils import MaskLayer2d
+from torch.utils.data import DataLoader
+from torchmetrics import Accuracy
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+
 from dime import CMIEstimator, MaskingPretrainer
+from dime.resnet_imagenet import Predictor, ResNet18Backbone, ValueNetwork
+from dime.utils import MaskLayer2d
 from dime.vit import PredictorViT, ValueNetworkViT
-from dime.resnet_imagenet import Predictor, ValueNetwork, ResNet18Backbone
-import timm
-import time
 
 vit_model_options = ['vit_small_patch16_224', 'vit_tiny_patch16_224']
 resnet_model_options = ['resnet18']
@@ -49,8 +54,27 @@ parser.add_argument('--pretrained_model_name', type=str,
 parser.add_argument('--trial', type=int,
                     default=1,
                     help="Trial Number")
+parser.add_argument('--load_pretrain_predictor', type=str,
+                    default=None,
+                    help="Path to a saved pretraining predictor state_dict to skip pretraining.")
 
 if __name__ == '__main__':
+    def timestamped_log(msg: str) -> None:
+        """Print to stdout and append to the per-run log file."""
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line)
+        with open(log_file_path, "a") as lf:
+            lf.write(line + "\n")
+
+    def _handle_signal(sig, frame):
+        try:
+            sig_name = signal.Signals(sig).name  # type: ignore[arg-type]
+        except Exception:
+            sig_name = str(sig)
+        timestamped_log(f"Received signal {sig_name}; attempting graceful shutdown.")
+        sys.exit(0)
+
     acc_metric = Accuracy(task='multiclass', num_classes=10)
 
     # Parse args
@@ -71,14 +95,24 @@ if __name__ == '__main__':
         raise argparse.ArgumentError("Network type and model name are not compatible")
 
     mask_layer = MaskLayer2d(append=False, mask_width=mask_width, patch_size=image_size/mask_width)
+
+    run_description = f"max_features_50_{pretrained_model_name}_lr_1e-5_use_entropy_True_{mask_type}_mask_width_{mask_width}_trial_{args.trial}"
+    run_dir = os.path.join("results", run_description)
+    os.makedirs(run_dir, exist_ok=True)
+    log_file_path = os.path.join(run_dir, "run_log.txt")
+
+    # Register signal handlers early so a system kill is recorded before exit.
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _handle_signal)
+    timestamped_log(f"Starting run {run_description}")
+    timestamped_log(f"Args: gpu={args.gpu}, lr={lr}, backbone={network_type}, model={pretrained_model_name}, mask_width={mask_width}, mask_type={mask_type}")
         
     device = torch.device('cuda', args.gpu)
     dataset_path = "/homes/gws/<username>/.fastai/data/imagenette2-320"
     if not os.path.exists(dataset_path):
         dataset_path = str(untar_data(URLs.IMAGENETTE_320))
         
-    norm_constants = ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-
+    norm_constants = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     # Setup for data loading.
     transforms_train = transforms.Compose([
         transforms.RandomResizedCrop(image_size),
@@ -97,6 +131,7 @@ if __name__ == '__main__':
     # Get Datasets
     train_dataset_train_transforms = ImageFolder(dataset_path+'/train', transforms_train)
     train_dataset_all_len = len(train_dataset_train_transforms)
+    timestamped_log(f"Loaded dataset from {dataset_path}; train size={train_dataset_all_len}")
 
     # Get train and val indices
     np.random.seed(0)
@@ -113,9 +148,8 @@ if __name__ == '__main__':
     # Prepare dataloaders.
     mbsize = 32
     train_dataloader = DataLoader(train_dataset, batch_size=mbsize, shuffle=True, pin_memory=True,
-                                  drop_last=True, num_workers=4)
-    val_dataloader = DataLoader(val_dataset, batch_size=mbsize, pin_memory=True, num_workers=4)
-    test_dataloader = DataLoader(test_dataset, batch_size=mbsize, pin_memory=True, num_workers=4)
+                                  drop_last=True, num_workers=2)
+    val_dataloader = DataLoader(val_dataset, batch_size=mbsize, pin_memory=True, num_workers=2)
 
     d_in = image_size * image_size
     d_out = 10
@@ -139,25 +173,34 @@ if __name__ == '__main__':
         value_network = ValueNetwork(backbone, expansion, block_layer_stride=block_layer_stride)
 
     starting_time = time.time()
+    pretrain_predictor_path = os.path.join(run_dir, "pretrain_predictor_state_dict.pt")
+    if args.load_pretrain_predictor:
+        timestamped_log(f"Loading pretrain predictor weights from {args.load_pretrain_predictor}")
+        state = torch.load(args.load_pretrain_predictor, map_location="cpu")
+        predictor.load_state_dict(state)
+        timestamped_log("Skipped mask pretraining; loaded provided weights.")
+    else:
+        timestamped_log("Beginning mask pretraining phase.")
+        pretrain = MaskingPretrainer(
+                predictor,
+                mask_layer,
+                lr=1e-5,
+                loss_fn=nn.CrossEntropyLoss(),
+                val_loss_fn=acc_metric)
+        
+        trainer = Trainer(
+                accelerator='gpu',
+                devices=[args.gpu],
+                max_epochs=50,
+                num_sanity_val_steps=0
+            )
+        trainer.fit(pretrain, train_dataloader, val_dataloader)
+        timestamped_log("Finished mask pretraining.")
+        torch.save(predictor.state_dict(), pretrain_predictor_path)
+        timestamped_log(f"Saved pretrain predictor state_dict to {pretrain_predictor_path}")
 
-    pretrain = MaskingPretrainer(
-            predictor,
-            mask_layer,
-            lr=1e-5,
-            loss_fn=nn.CrossEntropyLoss(),
-            val_loss_fn=acc_metric)
-    
-    trainer = Trainer(
-            accelerator='gpu',
-            devices=[args.gpu],
-            max_epochs=50,
-            num_sanity_val_steps=0
-        )
-    trainer.fit(pretrain, train_dataloader, val_dataloader)
-
-    run_description = f"max_features_50_{pretrained_model_name}_lr_1e-5_use_entropy_True_{mask_type}_mask_width_{mask_width}_trial_{args.trial}"
-    logger = TensorBoardLogger("logs", name=f"{run_description}")
-    checkpoint_callback = best_hard_callback = ModelCheckpoint(
+    logger = TensorBoardLogger("logs", name=f"{run_description}", default_hp_metric=False)
+    checkpoint_callback = ModelCheckpoint(
                 save_top_k=1,
                 monitor='Perf Val/Final',
                 mode='max',
@@ -190,10 +233,31 @@ if __name__ == '__main__':
                 callbacks=[checkpoint_callback]
             )
 
-    trainer.fit(greedy_cmi_estimator, train_dataloader, val_dataloader)
+    try:
+        trainer.fit(greedy_cmi_estimator, train_dataloader, val_dataloader)
+    except Exception as e:
+        timestamped_log(f"Training failed with exception: {e}")
+        raise
+    finally:
+        training_time = time.time() - starting_time
+        timestamped_log(f"Training time (s): {training_time:.2f}")
+        with open(os.path.join(run_dir, "training_time.txt"), 'a') as f:
+            f.write(f"Training time = {training_time}\n")
 
-    training_time = time.time() - start_time
-    print("Training time", training_time)
+    # Persist checkpoints for later reuse.
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if best_ckpt_path:
+        dest_best = os.path.join(run_dir, "best.ckpt")
+        shutil.copy(best_ckpt_path, dest_best)
+        timestamped_log(f"Saved best checkpoint to {dest_best}")
+    else:
+        timestamped_log("No best checkpoint was produced.")
 
-    with open("training_time.txt", 'a') as f:
-        f.write(f"Training time = {training_time}\n")
+    last_ckpt_path = os.path.join(run_dir, "last.ckpt")
+    trainer.save_checkpoint(last_ckpt_path)
+    timestamped_log(f"Saved final checkpoint to {last_ckpt_path}")
+
+    # Save lightweight weights for downstream use without Lightning.
+    torch.save(greedy_cmi_estimator.predictor.state_dict(), os.path.join(run_dir, "predictor_state_dict.pt"))
+    torch.save(greedy_cmi_estimator.value_network.state_dict(), os.path.join(run_dir, "value_network_state_dict.pt"))
+    timestamped_log("Exported predictor and value network state dicts.")

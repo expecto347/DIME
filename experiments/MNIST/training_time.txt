@@ -1,0 +1,5 @@
+Training time = 53.50765633583069
+Training time = 2.2093772888183594
+Training time = 1.2821123600006104
+Training time = 11.693430662155151
+Training time = 2.094578266143799

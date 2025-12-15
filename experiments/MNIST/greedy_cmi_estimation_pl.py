@@ -43,12 +43,11 @@ if __name__ == '__main__':
     # Set up data loaders.
     train_dataloader = DataLoader(
         train_dataset, batch_size=128, shuffle=True, pin_memory=True,
-        drop_last=True, num_workers=4)
+        drop_last=True)
     val_dataloader = DataLoader(
-        val_dataset, batch_size=128, shuffle=False, pin_memory=True, num_workers=4)
+        val_dataset, batch_size=128, shuffle=False, pin_memory=True)
     test_dataloader = DataLoader(
-        test_dataset, batch_size=128, shuffle=False, pin_memory=True, num_workers=4)
-
+        test_dataset, batch_size=128, shuffle=False, pin_memory=True)
     # Set up architecture.
     hidden = 512
     dropout = 0.3
@@ -130,7 +129,7 @@ if __name__ == '__main__':
         checkpoint_callback_perf = ModelCheckpoint(
             save_top_k=1,
             monitor='Perf Val/Final',
-            mode='min',
+            mode='max',
             filename='best_val_perf_model',
             verbose=False
         )

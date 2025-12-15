@@ -101,13 +101,13 @@ if __name__ == '__main__':
         # Set up data loaders.
         train_dataloader = DataLoader(
             train_dataset, batch_size=128, shuffle=True, pin_memory=True,
-            drop_last=True, num_workers=4)
+            drop_last=True, num_workers=2)
             
         val_dataloader = DataLoader(
-            val_dataset, batch_size=128, shuffle=False, pin_memory=True, num_workers=4)
+            val_dataset, batch_size=128, shuffle=False, pin_memory=True, num_workers=2)
             
         test_dataloader = DataLoader(
-            test_dataset, batch_size=128, shuffle=False, pin_memory=True, num_workers=4)
+            test_dataset, batch_size=128, shuffle=False, pin_memory=True, num_workers=2)
         
         pretrain = MaskingPretrainer(
             predictor,
